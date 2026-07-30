@@ -461,6 +461,25 @@ def fetch_indiegala_deals():
 _EPIC_GQL_URL = "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
 _EPIC_INVALID_SLUGS = {"home", "", "/home", "[]"}
 _DEMO_TITLE_RE = re.compile(r"\b(demo|prologue|trial|playtest|beta|free\s*to\s*play|f2p)\b", re.IGNORECASE)
+# 한국 상점 페이지에 뜨는 "출시 절차 확인/준비 중" 문구 — 이 게임은 국내에서 다운로드가 불가능하다.
+def _fetch_epic_kr_catalog():
+    """KR 국가 기준 무료 프로모션 목록을 조회해 (id 집합, 제목 집합)을 반환한다.
+
+    Epic은 한국 심의(출시 절차) 미확정 게임을 KR 국가 조회 결과에서 아예 제외하므로,
+    US 목록에는 있지만 KR 목록에 없는 게임 = "대한민국에서의 출시 절차를 확인 또는
+    준비 중입니다" 상태로 판별할 수 있다. 상점 HTML을 긁는 방식(봇 차단 403으로
+    사실상 항상 실패)을 대체한다. 조회 실패 시 None을 반환하며, 이 경우 호출부는
+    전부 "이용 가능"으로 간주한다(오탐 제외 방지).
+    """
+    try:
+        data = _get(_EPIC_GQL_URL, params={"locale": "en", "country": "KR", "allowCountries": "KR"}).json()
+    except Exception as e:
+        log.warning("Epic KR catalog fetch failed(전체 '이용가능' 처리): %s", e)
+        return None
+    elements = data.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
+    ids = {str(el.get("id") or "") for el in elements if el.get("id")}
+    titles = {str(el.get("title") or "").strip().lower() for el in elements if el.get("title")}
+    return ids, titles
 
 
 def _epic_store_url(el):
@@ -559,6 +578,17 @@ def fetch_epic_free():
             "rating": 0.0,
             "rating_count": 0,
         })
+    kr_catalog = _fetch_epic_kr_catalog()
+    for game in results:
+        if kr_catalog is None:
+            game["kr_available"] = True
+        else:
+            kr_ids, kr_titles = kr_catalog
+            game["kr_available"] = (
+                str(game.get("external_id") or "") in kr_ids
+                or str(game.get("title") or "").strip().lower() in kr_titles
+            )
+        log.info("Epic KR availability title=%s available=%s", game.get("title"), game["kr_available"])
     return results
 
 
@@ -666,17 +696,6 @@ def fetch_indiegala_free():
         except Exception:
             continue
     return results
-
-
-def _is_stove_demo_game(store_url):
-    try:
-        html = _get(store_url, html=True).text
-    except Exception as e:
-        log.warning("STOVE detail fetch failed: %s", e)
-        return False
-    if "/ko/store/search?types=DEMO" in html:
-        return True
-    return bool(re.search(r">\s*DEMO\s*<", html, re.IGNORECASE))
 
 
 def fetch_stove_free():
@@ -1030,70 +1049,6 @@ def fetch_stove_free():
 
 def fetch_stove_deals():
     return fetch_stove_free()
-
-
-def _fetch_stove_deals_legacy():
-    try:
-        from bs4 import BeautifulSoup
-        resp = _get("https://store.onstove.com/ko/store/stoveindie", html=True)
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        log.warning("STOVE fetch failed: %s", e)
-        return []
-    results = []
-    seen = set()
-    for anchor in soup.find_all("a", href=True):
-        href = str(anchor.get("href") or "").strip()
-        if "/ko/games/" not in href:
-            continue
-        parent = anchor.parent
-        block_text = " ".join(parent.get_text(" ", strip=True).split()) if parent is not None else ""
-        combined_text = f"{block_text} {' '.join(anchor.get_text(' ', strip=True).split())}".strip()
-        if "무료" not in combined_text and "FREE" not in combined_text.upper():
-            continue
-        game_id = href.rstrip("/").split("/")[-1]
-        if game_id in seen:
-            continue
-        seen.add(game_id)
-        title = ""
-        probe = parent
-        for _ in range(4):
-            if probe is None:
-                break
-            title_node = probe.find(["h1", "h2", "h3", "strong"])
-            if title_node is not None:
-                title = " ".join(title_node.get_text(" ", strip=True).split())
-                if title:
-                    break
-            probe = probe.parent
-        if not title:
-            title = game_id
-        if _DEMO_TITLE_RE.search(title):
-            continue
-        image_url = ""
-        image_node = anchor.find("img") or (parent.find("img") if parent is not None else None)
-        if image_node is not None:
-            image_url = image_node.get("src") or image_node.get("data-src") or ""
-        store_url = href if href.startswith("http") else f"https://store.onstove.com{href}"
-        if _is_stove_demo_game(store_url):
-            continue
-        results.append({
-            "external_id": f"stove_{game_id}",
-            "platform": "stove",
-            "title": title,
-            "image_url": image_url,
-            "store_url": store_url,
-            "original_price": 0.0,
-            "current_price": 0.0,
-            "discount_pct": 100,
-            "is_free_period": True,
-            "free_start": None,
-            "free_end": None,
-            "genres": [],
-            "rating": 0.0,
-            "rating_count": 0,
-        })
-    return results
 
 
 def _enrich_metacritic(items):
